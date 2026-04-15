@@ -1,0 +1,191 @@
+import numpy as np
+import pandas as pd
+
+# Build a subject-level amyloid summary table from the Berkeley amyloid file only.
+# Output: one row per subject with
+# - FIRST_AMY_POS_DATE: first SCANDATE where amyloid status is 1; 0 if never observed
+# - POS_FROM_FIRST_IMAGING: 1 if that first positive date came from the subject's first imaging row, else 0
+
+BERKELEY_FILE = "UCBERKELEY_AMY_6MM_13Apr2026.csv"
+OUTPUT_FILE = "Berkeley_First_Amyloid_Positive_By_Subject_13Apr2026.csv"
+
+REQUIRED_COLUMNS = [
+    "PTID",
+    "VISCODE2",
+    "AMYLOID_STATUS",
+    "AMYLOID_STATUS_COMPOSITE_REF",
+    "SCANDATE",
+    "PROCESSDATE",
+]
+
+
+POSITIVE_LABELS = {
+    "positive",
+    "pos",
+    "elevated",
+    "amyloid positive",
+    "amyloid-positive",
+    "positive scan",
+    "amyloid+",
+    "abnormal",
+    "1",
+    "1.0",
+    "true",
+    "yes",
+}
+
+NEGATIVE_LABELS = {
+    "negative",
+    "neg",
+    "non-elevated",
+    "not elevated",
+    "amyloid negative",
+    "amyloid-negative",
+    "normal",
+    "0",
+    "0.0",
+    "false",
+    "no",
+}
+
+
+
+def parse_numeric_status(value: object) -> float | None:
+    if pd.isna(value):
+        return None
+
+    try:
+        numeric_value = float(value)
+        if np.isfinite(numeric_value):
+            return numeric_value
+    except (TypeError, ValueError):
+        pass
+
+    return None
+
+
+
+def has_status_value(value: object) -> bool:
+    numeric_value = parse_numeric_status(value)
+    if numeric_value is not None:
+        return True
+
+    if pd.isna(value):
+        return False
+
+    normalized = str(value).strip().lower()
+    return normalized not in {"", "nan", "none"}
+
+
+
+def is_positive_status(value: object) -> bool:
+    numeric_value = parse_numeric_status(value)
+    if numeric_value is not None:
+        return numeric_value == 1.0
+
+    if pd.isna(value):
+        return False
+
+    normalized = str(value).strip().lower()
+    return normalized in POSITIVE_LABELS
+
+
+
+def is_negative_status(value: object) -> bool:
+    numeric_value = parse_numeric_status(value)
+    if numeric_value is not None:
+        return numeric_value == 0.0
+
+    if pd.isna(value):
+        return False
+
+    normalized = str(value).strip().lower()
+    return normalized in NEGATIVE_LABELS
+
+
+
+def classify_amyloid_row(row: pd.Series) -> str:
+    status_values = [row.get("AMYLOID_STATUS"), row.get("AMYLOID_STATUS_COMPOSITE_REF")]
+
+    if any(is_positive_status(value) for value in status_values):
+        return "positive"
+    if any(is_negative_status(value) for value in status_values):
+        return "negative"
+    if any(has_status_value(value) for value in status_values):
+        return "observed_unclassified"
+    return "missing"
+
+
+
+def load_berkeley_table() -> pd.DataFrame:
+    berkeley_table = pd.read_csv(BERKELEY_FILE, low_memory=False)
+
+    missing_columns = [column for column in REQUIRED_COLUMNS if column not in berkeley_table.columns]
+    if missing_columns:
+        raise ValueError(f"Berkeley table is missing required columns: {missing_columns}")
+
+    berkeley_table = berkeley_table[REQUIRED_COLUMNS].copy()
+    berkeley_table["SCANDATE"] = pd.to_datetime(berkeley_table["SCANDATE"], errors="coerce")
+    berkeley_table["PROCESSDATE"] = pd.to_datetime(berkeley_table["PROCESSDATE"], errors="coerce")
+    berkeley_table["AMY_CLASS"] = berkeley_table.apply(classify_amyloid_row, axis=1)
+
+    berkeley_table = berkeley_table[
+        berkeley_table["SCANDATE"].notna() & (berkeley_table["AMY_CLASS"] != "missing")
+    ].copy()
+
+    berkeley_table = berkeley_table.sort_values(["PTID", "SCANDATE", "VISCODE2"], na_position="last")
+
+    print(f"Loaded Berkeley table: {berkeley_table.shape[0]} usable rows")
+    print("Amyloid class counts:")
+    print(berkeley_table["AMY_CLASS"].value_counts(dropna=False).sort_index().to_string())
+
+    return berkeley_table
+
+
+
+def build_subject_summary(berkeley_table: pd.DataFrame) -> pd.DataFrame:
+    subject_rows: list[dict[str, object]] = []
+
+    for subject_id, subject_data in berkeley_table.groupby("PTID"):
+        subject_data = subject_data.sort_values(["SCANDATE", "VISCODE2"], na_position="last").copy()
+
+        first_row = subject_data.iloc[0]
+        positive_rows = subject_data[subject_data["AMY_CLASS"] == "positive"].copy()
+
+        if positive_rows.empty:
+            first_amy_pos_date = 0
+            pos_from_first_imaging = 0
+        else:
+            first_positive_row = positive_rows.iloc[0]
+            first_amy_pos_date = first_positive_row["SCANDATE"]
+            pos_from_first_imaging = int(first_positive_row.name == first_row.name)
+
+        subject_rows.append(
+            {
+                "subject_id": subject_id,
+                "FIRST_AMY_POS_DATE": first_amy_pos_date,
+                "POS_FROM_FIRST_IMAGING": pos_from_first_imaging,
+            }
+        )
+
+    summary_table = pd.DataFrame(subject_rows)
+
+    print(f"\nBuilt subject summary table: {len(summary_table)} rows")
+    print(f"Subjects with observed positive amyloid: {int((summary_table['FIRST_AMY_POS_DATE'] != 0).sum())}")
+    print(f"Subjects never observed positive: {int((summary_table['FIRST_AMY_POS_DATE'] == 0).sum())}")
+    print("\nPreview:")
+    print(summary_table.head(20).to_string(index=False))
+
+    return summary_table
+
+
+
+def main() -> None:
+    berkeley_table = load_berkeley_table()
+    summary_table = build_subject_summary(berkeley_table)
+    summary_table.to_csv(OUTPUT_FILE, index=False)
+    print(f"\nSaved subject-level amyloid summary to {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()

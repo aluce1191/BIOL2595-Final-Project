@@ -1,0 +1,330 @@
+
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+# Build a publication-style Table 1 from Final.csv.
+# The table is based on the final analytic sample:
+# - one baseline row per subject
+# - excludes subjects already amyloid-positive at first imaging
+# - keeps subjects with usable TTAMY and AMY_EVENT
+#
+# Output files:
+# - Table1_baseline_by_amyloid_event.csv
+# - Table1_baseline_subject_level.csv
+# - Table1_person_time_summary.csv
+# - Table1_censoring_summary.csv
+
+DATA_FILE_CANDIDATES = [
+    "Final.csv",
+    "Final",
+    "/mnt/data/Final.csv",
+]
+
+TABLE1_FILE = "Table1_baseline_by_amyloid_event.csv"
+SUBJECT_LEVEL_FILE = "Table1_baseline_subject_level.csv"
+PERSON_TIME_FILE = "Table1_person_time_summary.csv"
+CENSORING_FILE = "Table1_censoring_summary.csv"
+
+CATEGORICAL_VARIABLES = [
+    "PTGENDER_x",
+    "GENOTYPE",
+    "entry_research_group",
+]
+
+CONTINUOUS_VARIABLES = [
+    "entry_age",
+    "PTEDUCAT_x",
+    "MMSCORE",
+    "MOCA",
+    "CDRSB",
+    "FAQTOTAL",
+    "GDTOTAL",
+    "LDELTOTAL_x",
+    "TOTAL13",
+    "TOTSCORE",
+]
+
+DISPLAY_NAME_MAP = {
+    "PTGENDER_x": "Sex",
+    "GENOTYPE": "APOE genotype",
+    "entry_research_group": "Baseline research group",
+    "entry_age": "Age at baseline, years",
+    "PTEDUCAT_x": "Education, years",
+    "MMSCORE": "MMSE",
+    "MOCA": "MoCA",
+    "CDRSB": "CDR-SB",
+    "FAQTOTAL": "FAQ total",
+    "GDTOTAL": "GDS total",
+    "LDELTOTAL_x": "Logical memory delayed recall",
+    "TOTAL13": "ADAS-Cog total13",
+    "TOTSCORE": "Composite total score",
+}
+
+GROUP_ORDER = ["Overall", "Amyloid conversion", "Censored"]
+
+
+
+def resolve_data_file() -> str:
+    for candidate in DATA_FILE_CANDIDATES:
+        try:
+            with open(candidate, "rb"):
+                return candidate
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError(
+        "Could not find Final.csv. Looked for: " + ", ".join(DATA_FILE_CANDIDATES)
+    )
+
+
+
+def format_count_percent(count: int, denominator: int) -> str:
+    if denominator == 0:
+        return "0 (0%)"
+    percent = 100.0 * count / denominator
+    return f"{count} ({percent:.1f}%)"
+
+
+
+def format_mean_sd(series: pd.Series) -> str:
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    if numeric.empty:
+        return "NA"
+    return f"{numeric.mean():.2f} ({numeric.std(ddof=1):.2f})"
+
+
+
+def format_median_iqr(series: pd.Series) -> str:
+    numeric = pd.to_numeric(series, errors="coerce").dropna()
+    if numeric.empty:
+        return "NA"
+    q1 = numeric.quantile(0.25)
+    q3 = numeric.quantile(0.75)
+    return f"{numeric.median():.2f} ({q1:.2f}, {q3:.2f})"
+
+
+
+def clean_gender(value: object) -> str:
+    if pd.isna(value):
+        return "Missing"
+    text = str(value).strip()
+    mapping = {
+        "1": "Male",
+        "1.0": "Male",
+        "2": "Female",
+        "2.0": "Female",
+        "male": "Male",
+        "female": "Female",
+        "m": "Male",
+        "f": "Female",
+    }
+    return mapping.get(text.lower(), text)
+
+
+
+def clean_apoe(value: object) -> str:
+    if pd.isna(value):
+        return "Missing"
+    text = str(value).strip()
+    if text == "":
+        return "Missing"
+    return text
+
+
+
+def load_and_prepare_data() -> pd.DataFrame:
+    file_path = resolve_data_file()
+    data = pd.read_csv(file_path, low_memory=False)
+
+    required_columns = ["subject_id", "VISIT_DATE", "TTAMY", "AMY_EVENT", "POS_FROM_FIRST_IMAGING"]
+    missing_columns = [column for column in required_columns if column not in data.columns]
+    if missing_columns:
+        raise ValueError(f"Final.csv is missing required columns: {missing_columns}")
+
+    data["VISIT_DATE"] = pd.to_datetime(data["VISIT_DATE"], errors="coerce")
+    if "entry_date" in data.columns:
+        data["entry_date"] = pd.to_datetime(data["entry_date"], errors="coerce")
+
+    for column in ["TTAMY", "AMY_EVENT", "POS_FROM_FIRST_IMAGING"]:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+
+    sort_columns = [column for column in ["subject_id", "VISIT_DATE", "entry_date", "visit"] if column in data.columns]
+    data = data.sort_values(sort_columns, na_position="last")
+
+    baseline = data.drop_duplicates(subset=["subject_id"], keep="first").copy()
+
+    baseline = baseline[baseline["POS_FROM_FIRST_IMAGING"] != 1].copy()
+    baseline = baseline.dropna(subset=["TTAMY", "AMY_EVENT"]).copy()
+    baseline = baseline[np.isfinite(baseline["TTAMY"])].copy()
+    baseline = baseline[baseline["TTAMY"] >= 0].copy()
+    baseline["AMY_EVENT"] = baseline["AMY_EVENT"].astype(int)
+
+    baseline["PTGENDER_x"] = baseline["PTGENDER_x"].apply(clean_gender) if "PTGENDER_x" in baseline.columns else "Missing"
+    baseline["GENOTYPE"] = baseline["GENOTYPE"].apply(clean_apoe) if "GENOTYPE" in baseline.columns else "Missing"
+
+    baseline["AMY_EVENT_GROUP"] = baseline["AMY_EVENT"].map({1: "Amyloid conversion", 0: "Censored"})
+
+    print(f"Loaded analytic baseline sample: {baseline.shape[0]} subjects")
+    print("AMY_EVENT distribution:")
+    print(baseline["AMY_EVENT_GROUP"].value_counts(dropna=False).to_string())
+    return baseline
+
+
+
+def build_continuous_rows(data: pd.DataFrame) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+
+    grouped = {
+        "Overall": data,
+        "Amyloid conversion": data[data["AMY_EVENT"] == 1],
+        "Censored": data[data["AMY_EVENT"] == 0],
+    }
+
+    for variable in CONTINUOUS_VARIABLES:
+        if variable not in data.columns:
+            continue
+
+        mean_sd_row = {"Characteristic": f"{DISPLAY_NAME_MAP.get(variable, variable)}, mean (SD)"}
+        median_iqr_row = {"Characteristic": f"{DISPLAY_NAME_MAP.get(variable, variable)}, median (IQR)"}
+
+        for group_name in GROUP_ORDER:
+            group_data = grouped[group_name]
+            mean_sd_row[group_name] = format_mean_sd(group_data[variable])
+            median_iqr_row[group_name] = format_median_iqr(group_data[variable])
+
+        rows.append(mean_sd_row)
+        rows.append(median_iqr_row)
+
+    return rows
+
+
+
+def build_categorical_rows(data: pd.DataFrame) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+
+    grouped = {
+        "Overall": data,
+        "Amyloid conversion": data[data["AMY_EVENT"] == 1],
+        "Censored": data[data["AMY_EVENT"] == 0],
+    }
+
+    denominators = {group_name: len(group_data) for group_name, group_data in grouped.items()}
+
+    for variable in CATEGORICAL_VARIABLES:
+        if variable not in data.columns:
+            continue
+
+        variable_name = DISPLAY_NAME_MAP.get(variable, variable)
+        header_row = {"Characteristic": variable_name}
+        for group_name in GROUP_ORDER:
+            header_row[group_name] = ""
+        rows.append(header_row)
+
+        levels = data[variable].fillna("Missing").astype(str)
+        level_order = levels.value_counts(dropna=False).index.tolist()
+
+        for level in level_order:
+            level_row = {"Characteristic": f"  {level}"}
+            for group_name in GROUP_ORDER:
+                group_data = grouped[group_name]
+                count = int((group_data[variable].fillna("Missing").astype(str) == level).sum())
+                level_row[group_name] = format_count_percent(count, denominators[group_name])
+            rows.append(level_row)
+
+    return rows
+
+
+
+def build_core_rows(data: pd.DataFrame) -> list[dict[str, str]]:
+    grouped = {
+        "Overall": data,
+        "Amyloid conversion": data[data["AMY_EVENT"] == 1],
+        "Censored": data[data["AMY_EVENT"] == 0],
+    }
+
+    n_row = {"Characteristic": "N"}
+    for group_name in GROUP_ORDER:
+        n_row[group_name] = str(len(grouped[group_name]))
+
+    person_time_total = {"Characteristic": "Follow-up time, total years"}
+    person_time_mean = {"Characteristic": "Follow-up time, mean years (SD)"}
+    person_time_median = {"Characteristic": "Follow-up time, median years (IQR)"}
+
+    for group_name in GROUP_ORDER:
+        ttamy = pd.to_numeric(grouped[group_name]["TTAMY"], errors="coerce").dropna()
+        person_time_total[group_name] = f"{ttamy.sum():.2f}"
+        person_time_mean[group_name] = format_mean_sd(ttamy)
+        person_time_median[group_name] = format_median_iqr(ttamy)
+
+    return [n_row, person_time_total, person_time_mean, person_time_median]
+
+
+
+def build_table1(data: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    rows.extend(build_core_rows(data))
+    rows.extend(build_continuous_rows(data))
+    rows.extend(build_categorical_rows(data))
+    return pd.DataFrame(rows, columns=["Characteristic", *GROUP_ORDER])
+
+
+
+def build_person_time_summary(data: pd.DataFrame) -> pd.DataFrame:
+    grouped = []
+    for label, subset in [("Overall", data), ("Amyloid conversion", data[data["AMY_EVENT"] == 1]), ("Censored", data[data["AMY_EVENT"] == 0])]:
+        ttamy = pd.to_numeric(subset["TTAMY"], errors="coerce").dropna()
+        grouped.append(
+            {
+                "Group": label,
+                "N": len(subset),
+                "Total_person_time_years": ttamy.sum(),
+                "Mean_person_time_years": ttamy.mean() if not ttamy.empty else np.nan,
+                "SD_person_time_years": ttamy.std(ddof=1) if len(ttamy) > 1 else np.nan,
+                "Median_person_time_years": ttamy.median() if not ttamy.empty else np.nan,
+                "Q1_person_time_years": ttamy.quantile(0.25) if not ttamy.empty else np.nan,
+                "Q3_person_time_years": ttamy.quantile(0.75) if not ttamy.empty else np.nan,
+            }
+        )
+    return pd.DataFrame(grouped)
+
+
+
+def build_censoring_summary(data: pd.DataFrame) -> pd.DataFrame:
+    total_n = len(data)
+    event_n = int((data["AMY_EVENT"] == 1).sum())
+    censored_n = int((data["AMY_EVENT"] == 0).sum())
+
+    summary = pd.DataFrame(
+        [
+            {"Reason": "Amyloid conversion observed", "N": event_n, "Percent": 100 * event_n / total_n if total_n else np.nan},
+            {"Reason": "Right censored", "N": censored_n, "Percent": 100 * censored_n / total_n if total_n else np.nan},
+        ]
+    )
+    return summary
+
+
+
+def main() -> None:
+    baseline = load_and_prepare_data()
+    table1 = build_table1(baseline)
+    person_time_summary = build_person_time_summary(baseline)
+    censoring_summary = build_censoring_summary(baseline)
+
+    baseline.to_csv(SUBJECT_LEVEL_FILE, index=False)
+    table1.to_csv(TABLE1_FILE, index=False)
+    person_time_summary.to_csv(PERSON_TIME_FILE, index=False)
+    censoring_summary.to_csv(CENSORING_FILE, index=False)
+
+    print(f"\nSaved baseline subject-level file to {SUBJECT_LEVEL_FILE}")
+    print(f"Saved Table 1 to {TABLE1_FILE}")
+    print(f"Saved person-time summary to {PERSON_TIME_FILE}")
+    print(f"Saved censoring summary to {CENSORING_FILE}")
+
+    print("\nPreview of Table 1:")
+    print(table1.head(40).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

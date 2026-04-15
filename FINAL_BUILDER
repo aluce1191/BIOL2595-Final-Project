@@ -1,0 +1,195 @@
+import numpy as np
+import pandas as pd
+
+# Build row-level amyloid time-to-event labels for the merged table using:
+# 1) merged longitudinal table with VISIT_DATE for each row
+# 2) subject-level Berkeley summary table with first observed amyloid-positive date
+#
+# Output columns inserted immediately after VISIT_DATE:
+# - FIRST_AMY_POS_DATE
+# - POS_FROM_FIRST_IMAGING
+# - LAST_VISIT_DATE
+# - TTAMY
+# - AMY_EVENT
+# - AMY_ROW_EXCLUSION_REASON
+#
+# Rules:
+# - If subject is first observed already amyloid positive, TTAMY / AMY_EVENT stay missing.
+# - If subject never becomes amyloid positive, rows are right-censored at LAST_VISIT_DATE.
+# - If a row occurs after the first positive date, TTAMY / AMY_EVENT stay missing because that row is no longer at risk.
+# - If a row occurs exactly on the first positive date, TTAMY = 0 and AMY_EVENT = 1.
+
+MERGED_TABLE_FILE = "Merged_My_Table_UCBERKELEY_AMY_13Apr2026.csv"
+AMY_SUMMARY_FILE = "Berkeley_First_Amyloid_Positive_By_Subject_13Apr2026.csv"
+OUTPUT_FILE = "Merged_My_Table_UCBERKELEY_AMY_Final_13Apr2026.csv"
+
+REQUIRED_MERGED_COLUMNS = ["subject_id", "visit", "VISIT_DATE"]
+REQUIRED_SUMMARY_COLUMNS = ["subject_id", "FIRST_AMY_POS_DATE", "POS_FROM_FIRST_IMAGING"]
+
+INSERTED_COLUMNS = [
+    "FIRST_AMY_POS_DATE",
+    "POS_FROM_FIRST_IMAGING",
+    "LAST_VISIT_DATE",
+    "TTAMY",
+    "AMY_EVENT",
+    "AMY_ROW_EXCLUSION_REASON",
+]
+
+
+
+def load_tables() -> tuple[pd.DataFrame, pd.DataFrame]:
+    merged_table = pd.read_csv(MERGED_TABLE_FILE, low_memory=False)
+    amy_summary = pd.read_csv(AMY_SUMMARY_FILE, low_memory=False)
+
+    missing_merged = [col for col in REQUIRED_MERGED_COLUMNS if col not in merged_table.columns]
+    if missing_merged:
+        raise ValueError(f"Merged table missing required columns: {missing_merged}")
+
+    missing_summary = [col for col in REQUIRED_SUMMARY_COLUMNS if col not in amy_summary.columns]
+    if missing_summary:
+        raise ValueError(f"Amyloid summary table missing required columns: {missing_summary}")
+
+    merged_table["VISIT_DATE"] = pd.to_datetime(merged_table["VISIT_DATE"], errors="coerce")
+    amy_summary["FIRST_AMY_POS_DATE"] = pd.to_datetime(
+        amy_summary["FIRST_AMY_POS_DATE"],
+        errors="coerce",
+    )
+    amy_summary["POS_FROM_FIRST_IMAGING"] = pd.to_numeric(
+        amy_summary["POS_FROM_FIRST_IMAGING"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+
+    print(f"Loaded merged table: {merged_table.shape[0]} rows x {merged_table.shape[1]} columns")
+    print(f"Loaded amyloid summary: {amy_summary.shape[0]} rows x {amy_summary.shape[1]} columns")
+    return merged_table, amy_summary
+
+
+
+def build_last_visit_table(merged_table: pd.DataFrame) -> pd.DataFrame:
+    work = merged_table[["subject_id", "VISIT_DATE"]].copy()
+    work = work.dropna(subset=["VISIT_DATE"])
+
+    last_visit = (
+        work.groupby("subject_id", as_index=False)["VISIT_DATE"]
+        .max()
+        .rename(columns={"VISIT_DATE": "LAST_VISIT_DATE"})
+    )
+
+    print(f"Built last-visit table for {len(last_visit)} subjects")
+    return last_visit
+
+
+
+def merge_subject_level_dates(
+    merged_table: pd.DataFrame,
+    amy_summary: pd.DataFrame,
+    last_visit_table: pd.DataFrame,
+) -> pd.DataFrame:
+    output = merged_table.copy()
+
+    for column in ["FIRST_AMY_POS_DATE", "POS_FROM_FIRST_IMAGING", "LAST_VISIT_DATE"]:
+        if column in output.columns:
+            output = output.drop(columns=[column])
+
+    output = output.merge(amy_summary, how="left", on="subject_id")
+    output = output.merge(last_visit_table, how="left", on="subject_id")
+    output["LAST_VISIT_DATE"] = pd.to_datetime(output["LAST_VISIT_DATE"], errors="coerce")
+    return output
+
+
+
+def compute_row_level_ttamy(merged_table: pd.DataFrame) -> pd.DataFrame:
+    output = merged_table.copy()
+
+    output["TTAMY"] = np.nan
+    output["AMY_EVENT"] = np.nan
+    output["AMY_ROW_EXCLUSION_REASON"] = ""
+
+    already_positive_mask = output["POS_FROM_FIRST_IMAGING"] == 1
+    output.loc[already_positive_mask, "AMY_ROW_EXCLUSION_REASON"] = "already_positive_at_first_imaging"
+
+    missing_visit_mask = output["VISIT_DATE"].isna()
+    output.loc[missing_visit_mask, "AMY_ROW_EXCLUSION_REASON"] = "missing_visit_date"
+
+    never_positive_mask = output["FIRST_AMY_POS_DATE"].isna() & output["VISIT_DATE"].notna() & output["LAST_VISIT_DATE"].notna()
+    output.loc[never_positive_mask, "TTAMY"] = (
+        output.loc[never_positive_mask, "LAST_VISIT_DATE"] - output.loc[never_positive_mask, "VISIT_DATE"]
+    ).dt.days / 365.25
+    output.loc[never_positive_mask, "AMY_EVENT"] = 0
+
+    convertible_mask = (
+        output["FIRST_AMY_POS_DATE"].notna()
+        & (output["POS_FROM_FIRST_IMAGING"] == 0)
+        & output["VISIT_DATE"].notna()
+    )
+
+    event_rows_mask = convertible_mask & (output["VISIT_DATE"] <= output["FIRST_AMY_POS_DATE"])
+    output.loc[event_rows_mask, "TTAMY"] = (
+        output.loc[event_rows_mask, "FIRST_AMY_POS_DATE"] - output.loc[event_rows_mask, "VISIT_DATE"]
+    ).dt.days / 365.25
+    output.loc[event_rows_mask, "AMY_EVENT"] = 1
+
+    post_event_mask = convertible_mask & (output["VISIT_DATE"] > output["FIRST_AMY_POS_DATE"])
+    output.loc[post_event_mask, "AMY_ROW_EXCLUSION_REASON"] = "visit_after_first_positive"
+
+    negative_time_mask = output["TTAMY"].notna() & (output["TTAMY"] < 0)
+    output.loc[negative_time_mask, "TTAMY"] = np.nan
+    output.loc[negative_time_mask, "AMY_EVENT"] = np.nan
+    output.loc[negative_time_mask, "AMY_ROW_EXCLUSION_REASON"] = "negative_time_check"
+
+    return output
+
+
+
+def insert_columns_after_visit_date(merged_table: pd.DataFrame) -> pd.DataFrame:
+    output = merged_table.copy()
+
+    insert_after = output.columns.get_loc("VISIT_DATE") + 1
+    for column in INSERTED_COLUMNS:
+        if column in output.columns:
+            series = output.pop(column)
+            output.insert(insert_after, column, series)
+            insert_after += 1
+
+    return output
+
+
+
+def main() -> None:
+    merged_table, amy_summary = load_tables()
+    last_visit_table = build_last_visit_table(merged_table)
+    output_table = merge_subject_level_dates(merged_table, amy_summary, last_visit_table)
+    output_table = compute_row_level_ttamy(output_table)
+    output_table = insert_columns_after_visit_date(output_table)
+
+    print("\nRow-level outcome diagnostics:")
+    print(f"Rows with non-missing TTAMY: {int(output_table['TTAMY'].notna().sum())}")
+    print(f"Rows with AMY_EVENT = 1: {int((output_table['AMY_EVENT'] == 1).sum())}")
+    print(f"Rows with AMY_EVENT = 0: {int((output_table['AMY_EVENT'] == 0).sum())}")
+    print("\nExclusion reason counts:")
+    print(output_table["AMY_ROW_EXCLUSION_REASON"].replace("", "usable_row").value_counts(dropna=False).to_string())
+
+    preview_columns = [
+        column
+        for column in [
+            "subject_id",
+            "visit",
+            "VISIT_DATE",
+            "FIRST_AMY_POS_DATE",
+            "POS_FROM_FIRST_IMAGING",
+            "LAST_VISIT_DATE",
+            "TTAMY",
+            "AMY_EVENT",
+            "AMY_ROW_EXCLUSION_REASON",
+        ]
+        if column in output_table.columns
+    ]
+    print("\nPreview:")
+    print(output_table[preview_columns].head(40).to_string(index=False))
+
+    output_table.to_csv(OUTPUT_FILE, index=False)
+    print(f"\nSaved final table to {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
